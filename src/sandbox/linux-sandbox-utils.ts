@@ -1,5 +1,6 @@
 import { quote } from '../utils/shell-quote.js'
 import { logForDebugging } from '../utils/debug.js'
+import { realPathOf } from '../utils/real-path.js'
 import { whichSync } from '../utils/which.js'
 import { randomBytes } from 'node:crypto'
 import * as fs from 'fs'
@@ -175,7 +176,7 @@ function resolveSymlinkedDenyPath(targetPath: string): string | null {
   let current = targetPath
   for (let i = 0; i < MAX_SYMLINK_RESOLUTION_DEPTH; i++) {
     try {
-      return fs.realpathSync(current)
+      return realPathOf(current)
     } catch {
       // Some component is missing or dangling — canonicalize manually below.
     }
@@ -193,7 +194,7 @@ function resolveSymlinkedDenyPath(targetPath: string): string | null {
       remainder.unshift(path.basename(ancestor))
       ancestor = parent
       try {
-        resolvedAncestor = fs.realpathSync(ancestor)
+        resolvedAncestor = realPathOf(ancestor)
       } catch {
         // Keep walking up.
       }
@@ -451,7 +452,7 @@ export function unreadableDirectories(
           if (
             !stat.isDirectory() ||
             stat.uid !== process.getuid?.() ||
-            fs.realpathSync(dir) !== dir
+            realPathOf(dir) !== dir
           ) {
             break
           }
@@ -1287,9 +1288,12 @@ export function checkLinuxDependencies(
 export const OLDEST_FULLY_SUPPORTED_BWRAP_VERSION = '0.5.0'
 
 // Keyed by path, so a caller that passes an explicit bwrapPath is not
-// answered for another binary. Only an answer is kept: after a probe that
-// failed or timed out, the next call asks again.
-const bwrapVersions = new Map<string, string>()
+// answered for another binary. A probe that got no answer is kept too, as
+// null: it can block for the whole timeout, and callers ask several times
+// during one start-up.
+// INVARIANT: the version decides a warning and nothing else. No mount plan may
+// rest on it: one slow start would then decide for the life of the process.
+const bwrapVersions = new Map<string, string | null>()
 
 /** The version `bwrap --version` reports, or null when it could not be asked. */
 function probeBwrapVersion(bwrap: string): string | null {
@@ -1305,7 +1309,7 @@ function probeBwrapVersion(bwrap: string): string | null {
     probe.error === undefined && probe.status === 0
       ? (/\d+(?:\.\d+)*/.exec(probe.stdout ?? '')?.[0] ?? null)
       : null
-  if (version !== null) bwrapVersions.set(bwrap, version)
+  bwrapVersions.set(bwrap, version)
   return version
 }
 
@@ -2033,7 +2037,7 @@ async function generateFilesystemArgs(
     let canonical = canonicalFormCache.get(p)
     if (canonical === undefined) {
       try {
-        canonical = retryingTransient(() => fs.realpathSync(p))
+        canonical = retryingTransient(() => realPathOf(p))
       } catch (err) {
         canonical = p // vanished or unresolvable: the recorded form stands
         canonicalFormUnresolved.add(p)
@@ -2332,7 +2336,7 @@ async function generateFilesystemArgs(
       // bwrap follows symlinks, so --bind on a symlink makes the target writable
       // This could unexpectedly expose paths the user didn't intend to allow
       try {
-        const resolvedPath = fs.realpathSync(normalizedPath)
+        const resolvedPath = realPathOf(normalizedPath)
         // Trim trailing slashes before comparing: realpathSync never returns
         // a trailing slash, but normalizedPath may have one, which would cause
         // a false mismatch and incorrectly treat the path as a symlink.
@@ -3334,6 +3338,9 @@ async function generateFilesystemArgs(
  *
  * The seccomp-bpf filter blocks socket(AF_UNIX, ...) syscalls, preventing:
  * - Creating new Unix domain socket file descriptors
+ *
+ * It also blocks socket(AF_VSOCK, ...): the network namespace does not fence
+ * VM sockets, so one would reach out of the sandbox past the proxies.
  *
  * Security limitations:
  * - Does NOT block operations (bind, connect, sendto, etc.) on inherited Unix socket FDs
