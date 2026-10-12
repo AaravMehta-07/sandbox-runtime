@@ -114,14 +114,29 @@ export type RequestInfo = {
    */
   target?: { host: string; port: number }
   /**
-   * The request-target in origin form (path and query), exactly as it is
-   * forwarded upstream; path rules should key on this. It is normalized
-   * once on both paths (see normalizeRequestTarget) and that exact value
-   * is forwarded. (With no filterRequest configured there is no hook to
-   * judge the target: plain HTTP forwards the URL-parsed path and query,
+   * The request-target in origin form (path and query) as the client
+   * spelled it. These are the bytes forwarded upstream, unless the proxy
+   * was created with `ambiguousRequestTarget: 'normalize'`. `request.url`
+   * is a parsed URL and cannot hold them: its path has dot segments
+   * resolved already. (With no filterRequest configured there is no hook
+   * to judge the target: plain HTTP forwards the URL-parsed path and query,
    * and the TLS-terminated path forwards the client's bytes unchanged.)
    */
   requestTarget?: string
+  /**
+   * The same target normalized (see normalizeRequestTarget): what an
+   * upstream that resolves the spelling acts on, and what is forwarded
+   * under `'normalize'`. Where it names another path than `requestTarget`
+   * (only under `'asSpelled'` and `'normalize'`), a path rule has to hold
+   * for both.
+   */
+  normalizedRequestTarget?: string
+  /**
+   * Whether the two forms can name different resources (see
+   * readRequestTarget): what `'refuse'` refuses. They also differ, harmlessly,
+   * by a character the URL parser escapes and by an empty query.
+   */
+  requestTargetIsAmbiguous?: boolean
   /**
    * A copy of the client's header lines as received: name, value, name,
    * value, ... Some runtimes lower-case the names.
@@ -522,6 +537,55 @@ export function normalizeRequestTarget(
   }
   if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined
   return `${url.pathname.replace(/^\/{2,}/, '/')}${url.search}`
+}
+
+/** What a proxy with a filterRequest does with an ambiguous request-target. */
+export type AmbiguousRequestTarget = 'refuse' | 'asSpelled' | 'normalize'
+
+/**
+ * Both forms of a request-target that a filterRequest judges: `spelled`, in
+ * origin form as the client wrote it, and `normalized` (see
+ * normalizeRequestTarget). It is `ambiguous` when the two can name different
+ * resources, so that an upstream may act on another one than a policy
+ * judged: a dot segment (`%2e` included), a run of leading slashes, `\` in
+ * the path, or `#`. Not ambiguous, because every reader takes both forms for
+ * the same resource: a character the URL parser escapes (which ones differs
+ * by runtime), an empty query it drops, and the `/` an empty path becomes.
+ * Undefined for a shape normalizeRequestTarget refuses, an authority that
+ * ends elsewhere than the URL parser ends it, and a byte outside printable
+ * ASCII (a runtime that decodes those does not send them back unchanged).
+ */
+export function readRequestTarget(
+  raw: string,
+  method: string | undefined,
+): { spelled: string; normalized: string; ambiguous: boolean } | undefined {
+  const normalized = normalizeRequestTarget(raw, method)
+  if (normalized === undefined) return undefined
+  let spelled = raw.replace(/^https?:\/\/[^/?#\\]+/i, '')
+  if (spelled === '' || spelled.startsWith('?')) spelled = '/' + spelled
+  if (!/^(?:\*|\/[!-~]*)$/.test(spelled)) return undefined
+  const [a, b] = [spelled, normalized].map(t =>
+    t.replace(
+      /["'<>^`{}]/g,
+      c => '%' + c.charCodeAt(0).toString(16).toUpperCase(),
+    ),
+  )
+  return { spelled, normalized, ambiguous: a !== b && a !== b + '?' }
+}
+
+const AMBIGUOUS_TARGET_REASON =
+  'ambiguous request-target: as spelled and normalized it names different ' +
+  'paths (a dot segment, leading slashes, "\\" or "#"), and ' +
+  'network.ambiguousRequestTarget is "refuse"; nothing was forwarded'
+
+/** Refuse an ambiguous request-target: 400, and the reason for `onDeny`. */
+export function respondAmbiguousTarget(
+  res: ServerResponse,
+  mark: DenyMark = 'ambiguous-request-target',
+): string {
+  logForDebugging(`[proxy] ${AMBIGUOUS_TARGET_REASON}`, { level: 'warn' })
+  respondDenied(res, AMBIGUOUS_TARGET_REASON, mark, 400)
+  return AMBIGUOUS_TARGET_REASON
 }
 
 /**

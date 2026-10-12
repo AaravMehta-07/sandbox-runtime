@@ -17,8 +17,10 @@ import {
 import { CRL_PATH, type MitmCA } from './mitm-ca.js'
 import {
   decideAndRespond,
-  normalizeRequestTarget,
+  readRequestTarget,
   requestTargetAsSpelled,
+  respondAmbiguousTarget,
+  type AmbiguousRequestTarget,
   type DenyMark,
   applyHeaderEdits,
   notifyResponse,
@@ -303,6 +305,17 @@ export interface HttpProxyServerOptions {
    * absolute form inside a TLS-terminated tunnel.
    */
   requestTargetAsSpelled?: boolean
+
+  /**
+   * What becomes of a request filterRequest would judge whose target is
+   * ambiguous (see readRequestTarget), on both paths. `'refuse'`, the
+   * default: 400 before filterRequest is asked, reported through
+   * onFilterRequestDenied. `'asSpelled'`: forwarded as the client spelled
+   * it; filterRequest has to judge both forms. `'normalize'`: forwarded
+   * normalized, which breaks a signature over the path and names another
+   * resource to an upstream that takes the path literally.
+   */
+  ambiguousRequestTarget?: AmbiguousRequestTarget
 
   /**
    * Refuse, with 400 and before the allowlist is consulted, a request
@@ -775,6 +788,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
               foldHopByHop: options.foldHopByHop,
               denyHeader: options.denyHeader,
               requestTargetAsSpelled: options.requestTargetAsSpelled,
+              ambiguousRequestTarget: options.ambiguousRequestTarget,
               byteBudget,
               onEstablished: () => clearTimeout(deadline),
               onHandshakeProbe: isDone => {
@@ -1034,15 +1048,23 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       // forwarding the client's raw req.url. This ensures the upstream proxy
       // sees exactly the host we allowlist-checked, closing URL-parser
       // differential bypasses.
-      // With filterRequest, the request target is normalized before the
-      // hook sees it and that normalized target is what is forwarded;
-      // without it, the parsed path and query are forwarded unchanged.
-      // requestTargetAsSpelled comes first: it forwards the target as the
-      // client spelled it, hook or no hook.
+      // With filterRequest, the hook gets the target as spelled and
+      // normalized, the spelling is what is forwarded, and a target whose
+      // two forms can name different resources is refused unless
+      // ambiguousRequestTarget says which to send (see forwardUpstream in
+      // tls-terminate-proxy.ts); without it, the parsed path and query are
+      // forwarded unchanged. requestTargetAsSpelled comes first: it forwards
+      // the target as the client spelled it, hook or no hook.
+      const read =
+        options.filterRequest && !options.requestTargetAsSpelled
+          ? readRequestTarget(req.url!, req.method)
+          : undefined
       const requestTarget = options.requestTargetAsSpelled
         ? requestTargetAsSpelled(req.url!, { absolute: true })
         : options.filterRequest
-          ? normalizeRequestTarget(req.url!, req.method)
+          ? options.ambiguousRequestTarget === 'normalize'
+            ? read?.normalized
+            : read?.spelled
           : `${url.pathname}${url.search}`
       if (requestTarget === undefined) {
         respondDenied(
@@ -1054,6 +1076,20 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         return
       }
       const absUrl = `${url.protocol}//${authority}${requestTarget}`
+      if (
+        read?.ambiguous &&
+        options.ambiguousRequestTarget !== 'asSpelled' &&
+        options.ambiguousRequestTarget !== 'normalize'
+      ) {
+        const reason = respondAmbiguousTarget(res, markFor('bad_request'))
+        options.onFilterRequestDenied?.({
+          method: req.method ?? 'GET',
+          url: absUrl,
+          reason,
+          encodedCommand: auth.encodedCommand,
+        })
+        return
+      }
 
       // Per-request filter applies to plain HTTP too — otherwise a sandboxed
       // client could bypass it by using http:// where the upstream serves it.
@@ -1119,7 +1155,9 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
             : undefined,
           {
             target: { host: hostname, port },
-            requestTarget,
+            requestTarget: read?.spelled ?? requestTarget,
+            normalizedRequestTarget: read?.normalized,
+            requestTargetIsAmbiguous: read?.ambiguous,
             rawHeaders: [...req.rawHeaders],
             scheme: 'http',
           },

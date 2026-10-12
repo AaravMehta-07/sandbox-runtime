@@ -744,6 +744,7 @@ async function startMuxProxyServer(
     stripResponseHeaders: config?.network.stripResponseHeaders,
     refuseOpaqueTunnels: config?.network.refuseOpaqueTunnels,
     requireHostMatch: config?.network.requireHostMatch,
+    ambiguousRequestTarget: config?.network.ambiguousRequestTarget,
     maxTerminatedTunnels: config?.network.tlsTerminate?.maxTunnels,
     tlsHandshakeTimeoutMs: config?.network.tlsTerminate?.handshakeTimeoutMs,
     onFilterRequestDenied: ({ method, url, reason, encodedCommand }) => {

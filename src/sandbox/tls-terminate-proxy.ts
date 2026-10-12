@@ -30,8 +30,10 @@ import {
 import type { MitmCA } from './mitm-ca.js'
 import {
   decideAndRespond,
-  normalizeRequestTarget,
+  readRequestTarget,
   requestTargetAsSpelled,
+  respondAmbiguousTarget,
+  type AmbiguousRequestTarget,
   type DenyMark,
   applyHeaderEdits,
   notifyResponse,
@@ -297,6 +299,8 @@ export type TerminateTarget = {
   denyHeader?: string
   /** Forward the request-target as spelled (see HttpProxyServerOptions.requestTargetAsSpelled). */
   requestTargetAsSpelled?: boolean
+  /** What becomes of an ambiguous request-target (see HttpProxyServerOptions.ambiguousRequestTarget). */
+  ambiguousRequestTarget?: AmbiguousRequestTarget
   /** The TLS server name the client sent (set by terminateAndForward). */
   clientServerName?: string
   /** The ClientHello carries a server name that could not be read (see serverNameFromClientHello). */
@@ -859,22 +863,31 @@ async function forwardUpstream(
   // yields a well-formed URL, and discard any client-supplied authority so
   // the CONNECT-verified target stays authoritative (same rationale as the
   // Host-header note below).
-  // With filterRequest, the request target is normalized before the hook
-  // sees it and that normalized target is what is forwarded: some runtimes'
-  // HTTP clients normalize it again on the way out, and the hook must judge
-  // exactly what is sent. A target of any other shape could make the judged
-  // URL name another host, so it is refused. Without filterRequest nothing
-  // judges the path, so the target is forwarded unchanged (and a masked AWS
-  // credential is re-signed over those same bytes). requestTargetAsSpelled
-  // comes first: it forwards the target as the client spelled it.
+  // With filterRequest, the hook gets the target as spelled and normalized,
+  // and the spelling is what is forwarded: rewriting it would break a
+  // signature over the path, or have a masked AWS credential re-signed for
+  // a resource the client did not name. Where the two forms can name
+  // different resources the hook may have judged another one than the
+  // upstream acts on, so the request is refused unless
+  // ambiguousRequestTarget says which form to send. A target of any other
+  // shape could make the judged URL name another host, so it is refused.
+  // Without filterRequest nothing judges the path, so the target is
+  // forwarded unchanged. requestTargetAsSpelled comes first: it forwards the
+  // target as the client spelled it.
   const markFor = (code: string): DenyMark | undefined =>
     target.denyHeader !== undefined
       ? { name: target.denyHeader, value: code }
       : undefined
+  const read =
+    filterRequest && !target.requestTargetAsSpelled
+      ? readRequestTarget(req.url ?? '/', req.method)
+      : undefined
   const path = target.requestTargetAsSpelled
     ? requestTargetAsSpelled(req.url ?? '/')
     : filterRequest
-      ? normalizeRequestTarget(req.url ?? '/', req.method)
+      ? target.ambiguousRequestTarget === 'normalize'
+        ? read?.normalized
+        : read?.spelled
       : originFormPath(req.url)
   if (path === undefined) {
     respondDenied(res, 'malformed request-target', markFor('bad_request'), 400)
@@ -897,6 +910,21 @@ async function forwardUpstream(
   }
   // The tunnel target as it goes on the wire: filterRequest URL, Host, SigV4.
   const authority = formatAuthority(target.hostname, target.port, 443)
+  if (
+    read?.ambiguous &&
+    target.ambiguousRequestTarget !== 'asSpelled' &&
+    target.ambiguousRequestTarget !== 'normalize'
+  ) {
+    const why = respondAmbiguousTarget(res, markFor('bad_request'))
+    target.onFilterRequestDeny?.(
+      req.method ?? 'GET',
+      `https://${authority}${path}`,
+      why,
+    )
+    // Like a denial: a body still to come must not keep the tunnel.
+    destroyAfterDenial(req, res)
+    return
+  }
   let body: Readable = req
   let decision: RequestDecision | undefined
   const sni = target.clientServerName ?? serverNameOf(req)
@@ -955,7 +983,9 @@ async function forwardUpstream(
       {
         sni,
         target: { host: target.hostname, port: target.port },
-        requestTarget: path,
+        requestTarget: read?.spelled ?? path,
+        normalizedRequestTarget: read?.normalized,
+        requestTargetIsAmbiguous: read?.ambiguous,
         rawHeaders: [...req.rawHeaders],
         scheme: 'https',
       },
